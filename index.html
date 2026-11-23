@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PA Tuner recorder</title>
+<style>
+  :root { --bg: #111; --fg: #eee; --muted: #999; --accent: #4caf50; --warn: #ff9800; --bad: #f44336; --panel: #1c1c1c; }
+  @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --fg: #111; --muted: #555; --panel: #fff; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 560px; margin-inline: auto; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  p.note { color: var(--muted); margin: 0 0 16px; font-size: 0.9rem; }
+  button { width: 100%; padding: 22px; font-size: 1.4rem; border: 0; border-radius: 14px; color: #fff;
+           background: var(--accent); margin: 8px 0; }
+  button.stop { background: var(--bad); }
+  button:disabled { opacity: 0.4; }
+  .panel { background: var(--panel); border-radius: 12px; padding: 12px 14px; margin: 12px 0; }
+  .big { font-size: 2.4rem; font-variant-numeric: tabular-nums; text-align: center; }
+  meter { width: 100%; height: 22px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+  td { padding: 3px 0; vertical-align: top; } td:first-child { color: var(--muted); width: 48%; }
+  .warn { color: var(--warn); } .bad { color: var(--bad); }
+  a.dl { display: block; text-align: center; padding: 14px; border-radius: 12px; background: var(--panel);
+         color: var(--fg); margin: 8px 0; text-decoration: none; border: 1px solid var(--muted); }
+</style>
+</head>
+<body>
+<h1>PA Tuner recorder</h1>
+<p class="note">Microphone gate (build spec section 13). Records mono with echo cancellation, noise suppression and
+automatic gain requested off, and saves a 32-bit float WAV for <code>pat measure</code>. Play the reference track
+from another device. Nothing leaves this phone.</p>
+
+<button id="start">Record</button>
+<button id="stop" class="stop" disabled>Stop</button>
+
+<div class="panel">
+  <div class="big" id="time">0.0 s</div>
+  <meter id="level" min="-60" max="0" low="-18" high="-3" optimum="-12" value="-60"></meter>
+  <div id="peak" class="note">Peak: -</div>
+</div>
+
+<div class="panel">
+  <table id="settings"><tr><td>Microphone settings</td><td>not started</td></tr></table>
+</div>
+
+<div id="downloads"></div>
+
+<script>
+"use strict";
+const WORKLET = `
+class Tap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(ch.slice(0));
+    return true;
+  }
+}
+registerProcessor("tap", Tap);`;
+
+let ctx, stream, node, src, chunks = [], peak = 0, t0 = 0, timer, wake;
+const $ = (id) => document.getElementById(id);
+
+function row(k, v, cls) {
+  return `<tr><td>${k}</td><td class="${cls || ""}">${v}</td></tr>`;
+}
+
+function showSettings(track, rate) {
+  const s = track.getSettings ? track.getSettings() : {};
+  const off = (v) => v === false ? "off" : (v === undefined ? "not reported" : "ON");
+  const cls = (v) => v === false ? "" : "warn";
+  $("settings").innerHTML =
+    row("Device", track.label || "default") +
+    row("Echo cancellation", off(s.echoCancellation), cls(s.echoCancellation)) +
+    row("Noise suppression", off(s.noiseSuppression), cls(s.noiseSuppression)) +
+    row("Automatic gain", off(s.autoGainControl), cls(s.autoGainControl)) +
+    row("Sample rate", `${rate} Hz` + (s.sampleRate ? ` (track ${s.sampleRate})` : ""), rate === 48000 ? "" : "warn") +
+    row("Channels", String(s.channelCount || "not reported"));
+  return s;
+}
+
+function wav32(samples, rate) {
+  const n = samples.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 4, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 3, true); v.setUint16(22, 1, true);   // IEEE float, mono
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 32, true);
+  str(36, "data"); v.setUint32(40, n * 4, true);
+  new Float32Array(buf, 44).set(samples);
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function link(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name; a.className = "dl"; a.textContent = `Save ${name}`;
+  $("downloads").prepend(a);
+}
+
+$("start").onclick = async () => {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000 } });
+    ctx = new AudioContext({ sampleRate: 48000 });
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+    src = ctx.createMediaStreamSource(stream);
+    node = new AudioWorkletNode(ctx, "tap");
+    chunks = []; peak = 0;
+    node.port.onmessage = (e) => {
+      chunks.push(e.data);
+      let p = 0, ss = 0;
+      for (const x of e.data) { const a = Math.abs(x); if (a > p) p = a; ss += x * x; }
+      peak = Math.max(peak, p);
+      $("level").value = Math.max(-60, 10 * Math.log10(ss / e.data.length + 1e-12));
+    };
+    src.connect(node);                       // not connected to the output: nothing is played back
+    const s = showSettings(stream.getAudioTracks()[0], ctx.sampleRate);
+    window._captureInfo = { settings: s, contextRate: ctx.sampleRate, userAgent: navigator.userAgent,
+                            started: new Date().toISOString() };
+    try { wake = await navigator.wakeLock.request("screen"); } catch (_) { wake = null; }
+    t0 = performance.now();
+    timer = setInterval(() => {
+      $("time").textContent = ((performance.now() - t0) / 1000).toFixed(1) + " s";
+      const db = 20 * Math.log10(peak + 1e-12);
+      $("peak").innerHTML = `Peak: ${db.toFixed(1)} dBFS` + (peak >= 0.99 ? ' <span class="bad">CLIPPED</span>' : "");
+    }, 100);
+    $("start").disabled = true; $("stop").disabled = false;
+  } catch (err) {
+    $("settings").innerHTML = row("Error", String(err), "bad");
+  }
+};
+
+$("stop").onclick = async () => {
+  clearInterval(timer);
+  src.disconnect(); node.disconnect();
+  stream.getTracks().forEach((t) => t.stop());
+  if (wake) { try { await wake.release(); } catch (_) {} }
+  const rate = ctx.sampleRate;
+  await ctx.close();
+  const n = chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(n);
+  let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const info = { ...window._captureInfo, stopped: new Date().toISOString(), samples: n, seconds: n / rate,
+                 peakDbfs: 20 * Math.log10(peak + 1e-12), clipped: peak >= 0.99 };
+  link(new Blob([JSON.stringify(info, null, 2)], { type: "application/json" }), `capture-${stamp}.json`);
+  link(wav32(all, rate), `capture-${stamp}.wav`);
+  $("start").disabled = false; $("stop").disabled = true;
+};
+</script>
+</body>
+</html>
