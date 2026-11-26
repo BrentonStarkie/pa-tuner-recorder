@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PA Tuner recorder</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-title" content="PA Recorder">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111111">
 <style>
   :root { --bg: #111; --fg: #eee; --muted: #999; --accent: #4caf50; --warn: #ff9800; --bad: #f44336; --panel: #1c1c1c; }
   @media (prefers-color-scheme: light) { :root { --bg: #fafafa; --fg: #111; --muted: #555; --panel: #fff; } }
@@ -42,7 +47,8 @@ from another device. Nothing leaves this phone.</p>
 </div>
 
 <div class="panel">
-  <table id="settings"><tr><td>Microphone settings</td><td>not started</td></tr></table>
+  <table id="settings"><tr><td>Opened from</td><td id="mode">-</td></tr>
+    <tr><td>Microphone settings</td><td>not started</td></tr></table>
 </div>
 
 <div id="downloads"></div>
@@ -62,6 +68,12 @@ registerProcessor("tap", Tap);`;
 let ctx, stream, node, src, chunks = [], peak = 0, t0 = 0, timer, wake;
 const $ = (id) => document.getElementById(id);
 
+// Home screen (installed) or a browser tab: Phase 2 build step 2 compares the two.
+const OPENED_FROM = (matchMedia("(display-mode: standalone)").matches || navigator.standalone === true)
+  ? "home screen" : "browser tab";
+$("mode").textContent = OPENED_FROM;
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+
 function row(k, v, cls) {
   return `<tr><td>${k}</td><td class="${cls || ""}">${v}</td></tr>`;
 }
@@ -71,6 +83,7 @@ function showSettings(track, rate) {
   const off = (v) => v === false ? "off" : (v === undefined ? "not reported" : "ON");
   const cls = (v) => v === false ? "" : "warn";
   $("settings").innerHTML =
+    row("Opened from", OPENED_FROM) +
     row("Device", track.label || "default") +
     row("Echo cancellation", off(s.echoCancellation), cls(s.echoCancellation)) +
     row("Noise suppression", off(s.noiseSuppression), cls(s.noiseSuppression)) +
@@ -115,7 +128,7 @@ $("start").onclick = async () => {
     };
     src.connect(node);                       // not connected to the output: nothing is played back
     const s = showSettings(stream.getAudioTracks()[0], ctx.sampleRate);
-    window._captureInfo = { settings: s, contextRate: ctx.sampleRate, userAgent: navigator.userAgent,
+    window._captureInfo = { openedFrom: OPENED_FROM, settings: s, contextRate: ctx.sampleRate, userAgent: navigator.userAgent,
                             started: new Date().toISOString() };
     try { wake = await navigator.wakeLock.request("screen"); } catch (_) { wake = null; }
     t0 = performance.now();
